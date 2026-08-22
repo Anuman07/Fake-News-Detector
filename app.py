@@ -1,8 +1,3 @@
-# =============================================================================
-# app.py - Fake News Detector for Students (Streamlit Application)
-# =============================================================================
-# Run with: streamlit run app.py
-# =============================================================================
 
 import streamlit as st
 import pandas as pd
@@ -15,9 +10,6 @@ import time
 from pathlib import Path
 from collections import Counter
 
-# =============================================================================
-# NLTK SETUP - Fix permission warnings by using a private directory
-# =============================================================================
 NLTK_DATA_DIR = os.path.join(os.path.expanduser("~"), "nltk_data_private")
 os.makedirs(NLTK_DATA_DIR, exist_ok=True)
 
@@ -46,9 +38,6 @@ from sklearn.preprocessing import StandardScaler
 from scipy.sparse import hstack, csr_matrix
 
 
-# =============================================================================
-# Safe tokenizers (fallback if NLTK data still missing)
-# =============================================================================
 def safe_word_tokenize(text):
     try:
         return word_tokenize(text)
