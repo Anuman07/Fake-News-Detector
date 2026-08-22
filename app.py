@@ -1,4 +1,8 @@
-
+# =============================================================================
+# app.py - Fake News Detector for Students (Streamlit Application)
+# =============================================================================
+# Run with: streamlit run app.py
+# =============================================================================
 
 import streamlit as st
 import pandas as pd
@@ -6,34 +10,71 @@ import numpy as np
 import re
 import string
 import os
-import pickle
 import joblib
 import time
+from pathlib import Path
+from collections import Counter
 
-# NLP
+# =============================================================================
+# NLTK SETUP - Fix permission warnings by using a private directory
+# =============================================================================
+NLTK_DATA_DIR = os.path.join(os.path.expanduser("~"), "nltk_data_private")
+os.makedirs(NLTK_DATA_DIR, exist_ok=True)
+
 import nltk
+if NLTK_DATA_DIR not in nltk.data.path:
+    nltk.data.path.insert(0, NLTK_DATA_DIR)
+
+def _safe_nltk_download(pkg):
+    try:
+        nltk.download(pkg, download_dir=NLTK_DATA_DIR, quiet=True)
+    except Exception as e:
+        print(f"NLTK download failed for {pkg}: {e}")
+
+for pkg in ["punkt", "punkt_tab", "stopwords", "wordnet", "omw-1.4"]:
+    _safe_nltk_download(pkg)
+
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize, sent_tokenize
 from nltk.stem import WordNetLemmatizer
 from textblob import TextBlob
-from collections import Counter
 
 # ML
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 from scipy.sparse import hstack, csr_matrix
 
-# Download NLTK data
-nltk.download('punkt', quiet=True)
-nltk.download('punkt_tab', quiet=True)
-nltk.download('stopwords', quiet=True)
-nltk.download('wordnet', quiet=True)
 
-# Try to import transformers for summarization
-try:
-    from transformers import pipeline as hf_pipeline
-    HAS_TRANSFORMERS = True
-except ImportError:
-    HAS_TRANSFORMERS = False
+# =============================================================================
+# Safe tokenizers (fallback if NLTK data still missing)
+# =============================================================================
+def safe_word_tokenize(text):
+    try:
+        return word_tokenize(text)
+    except Exception:
+        return re.findall(r"\b\w+\b", text)
+
+def safe_sent_tokenize(text):
+    try:
+        return sent_tokenize(text)
+    except Exception:
+        # Simple regex-based sentence splitter
+        sents = re.split(r'(?<=[.!?])\s+', text.strip())
+        return [s for s in sents if s]
+
+def safe_stopwords():
+    try:
+        return set(stopwords.words("english"))
+    except Exception:
+        # Minimal fallback stopword list
+        return set("""a an the and or but if while of at by for with about against between
+        into through during before after above below to from up down in out on off over under
+        again further then once here there when where why how all any both each few more most
+        other some such no nor not only own same so than too very s t can will just don should
+        now is are was were be been being have has had do does did i you he she it we they me
+        him her us them my your his its our their this that these those""".split())
+
 
 # =============================================================================
 # PAGE CONFIGURATION
@@ -79,20 +120,6 @@ st.markdown("""
         border-radius: 5px;
         margin: 1rem 0;
     }
-    .metric-card {
-        background-color: #f8f9fa;
-        border-radius: 10px;
-        padding: 1rem;
-        text-align: center;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .tip-box {
-        background-color: #e8f4f8;
-        border-left: 5px solid #17a2b8;
-        padding: 1rem;
-        border-radius: 5px;
-        margin: 1rem 0;
-    }
     .summary-box {
         background-color: #f0f7ff;
         border: 1px solid #b8daff;
@@ -100,29 +127,29 @@ st.markdown("""
         padding: 1.5rem;
         margin: 1rem 0;
     }
-    .stProgress > div > div > div > div {
-        background-color: #667eea;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 
 # =============================================================================
-# TEXT PREPROCESSOR CLASS
+# TEXT PREPROCESSOR
 # =============================================================================
 class TextPreprocessor:
-    """Comprehensive text preprocessor for fake news detection."""
-
     def __init__(self):
-        self.stop_words = set(stopwords.words('english'))
-        self.lemmatizer = WordNetLemmatizer()
+        self.stop_words = safe_stopwords()
+        try:
+            self.lemmatizer = WordNetLemmatizer()
+            # test
+            self.lemmatizer.lemmatize("tests")
+        except Exception:
+            self.lemmatizer = None
         self.sensational_words = {
             'shocking', 'unbelievable', 'breaking', 'urgent', 'exclusive',
             'bombshell', 'stunning', 'incredible', 'horrifying', 'terrifying',
             'amazing', 'miracle', 'secret', 'conspiracy', 'exposed', 'revealed',
-            'banned', 'censored', 'they dont want you to know', 'wake up',
+            'banned', 'censored', "they dont want you to know", 'wake up',
             'share before deleted', 'must see', 'jaw dropping', 'mind blowing',
-            'you wont believe', 'outrageous', 'insane', 'epic', 'destroyed',
+            "you wont believe", 'outrageous', 'insane', 'epic', 'destroyed',
             'obliterated', 'annihilated', 'slammed', 'blasted', 'torched'
         }
 
@@ -136,43 +163,49 @@ class TextPreprocessor:
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
+    def _lemmatize(self, token):
+        if self.lemmatizer is not None:
+            try:
+                return self.lemmatizer.lemmatize(token)
+            except Exception:
+                return token
+        return token
+
     def preprocess_for_tfidf(self, text):
-        text = self.clean_text(text)
-        text = text.lower()
+        text = self.clean_text(text).lower()
         text = re.sub(r'[^\w\s]', ' ', text)
-        tokens = word_tokenize(text)
-        tokens = [self.lemmatizer.lemmatize(t) for t in tokens
+        tokens = safe_word_tokenize(text)
+        tokens = [self._lemmatize(t) for t in tokens
                   if t not in self.stop_words and len(t) > 2 and not t.isdigit()]
         return ' '.join(tokens)
 
     def extract_linguistic_features(self, text):
         text = self.clean_text(text)
-        features = {}
-
+        keys = [
+            'char_count', 'word_count', 'sentence_count', 'avg_word_length',
+            'avg_sentence_length', 'vocabulary_richness', 'uppercase_ratio',
+            'exclamation_count', 'question_count', 'ellipsis_count',
+            'capital_word_count', 'sensational_word_count', 'sentiment_polarity',
+            'sentiment_subjectivity', 'digit_ratio', 'punctuation_ratio',
+            'quote_count', 'paragraph_count', 'long_word_ratio',
+            'stopword_ratio', 'type_token_ratio'
+        ]
         if len(text) == 0:
-            return {k: 0 for k in [
-                'char_count', 'word_count', 'sentence_count', 'avg_word_length',
-                'avg_sentence_length', 'vocabulary_richness', 'uppercase_ratio',
-                'exclamation_count', 'question_count', 'ellipsis_count',
-                'capital_word_count', 'sensational_word_count', 'sentiment_polarity',
-                'sentiment_subjectivity', 'digit_ratio', 'punctuation_ratio',
-                'quote_count', 'paragraph_count', 'long_word_ratio',
-                'stopword_ratio', 'type_token_ratio'
-            ]}
+            return {k: 0 for k in keys}
 
         words = text.split()
-        sentences = sent_tokenize(text)
+        sentences = safe_sent_tokenize(text)
+        features = {}
 
         features['char_count'] = len(text)
         features['word_count'] = len(words)
-        features['sentence_count'] = len(sentences)
-        features['avg_word_length'] = np.mean([len(w) for w in words]) if words else 0
-        features['avg_sentence_length'] = len(words) / len(sentences) if sentences else 0
+        features['sentence_count'] = max(len(sentences), 1)
+        features['avg_word_length'] = float(np.mean([len(w) for w in words])) if words else 0.0
+        features['avg_sentence_length'] = len(words) / max(len(sentences), 1)
 
-        unique_words = set([w.lower() for w in words])
+        unique_words = set(w.lower() for w in words)
         features['vocabulary_richness'] = len(unique_words) / len(words) if words else 0
-
-        features['uppercase_ratio'] = sum(1 for c in text if c.isupper()) / len(text) if text else 0
+        features['uppercase_ratio'] = sum(1 for c in text if c.isupper()) / len(text)
         features['exclamation_count'] = text.count('!')
         features['question_count'] = text.count('?')
         features['ellipsis_count'] = text.count('...')
@@ -181,12 +214,16 @@ class TextPreprocessor:
         text_lower = text.lower()
         features['sensational_word_count'] = sum(1 for sw in self.sensational_words if sw in text_lower)
 
-        blob = TextBlob(text[:5000])
-        features['sentiment_polarity'] = blob.sentiment.polarity
-        features['sentiment_subjectivity'] = blob.sentiment.subjectivity
+        try:
+            blob = TextBlob(text[:5000])
+            features['sentiment_polarity'] = float(blob.sentiment.polarity)
+            features['sentiment_subjectivity'] = float(blob.sentiment.subjectivity)
+        except Exception:
+            features['sentiment_polarity'] = 0.0
+            features['sentiment_subjectivity'] = 0.0
 
-        features['digit_ratio'] = sum(1 for c in text if c.isdigit()) / len(text) if text else 0
-        features['punctuation_ratio'] = sum(1 for c in text if c in string.punctuation) / len(text) if text else 0
+        features['digit_ratio'] = sum(1 for c in text if c.isdigit()) / len(text)
+        features['punctuation_ratio'] = sum(1 for c in text if c in string.punctuation) / len(text)
         features['quote_count'] = text.count('"') + text.count("'")
         features['paragraph_count'] = text.count('\n') + 1
         features['long_word_ratio'] = sum(1 for w in words if len(w) > 6) / len(words) if words else 0
@@ -199,11 +236,9 @@ class TextPreprocessor:
 
 
 # =============================================================================
-# CREDIBILITY SCORER CLASS
+# CREDIBILITY SCORER
 # =============================================================================
 class CredibilityScorer:
-    """Heuristic-based credibility scoring."""
-
     def __init__(self):
         self.credible_indicators = [
             'according to', 'research shows', 'study finds', 'data suggests',
@@ -212,7 +247,7 @@ class CredibilityScorer:
             'peer reviewed', 'published in', 'university of', 'institute of'
         ]
         self.non_credible_indicators = [
-            'you wont believe', 'they dont want you to know', 'shocking truth',
+            'you wont believe', "they dont want you to know", 'shocking truth',
             'share before', 'must see', 'breaking exclusive', 'conspiracy',
             'cover up', 'mainstream media lies', 'wake up sheeple',
             'big pharma', 'deep state', 'false flag', 'hoax',
@@ -228,18 +263,16 @@ class CredibilityScorer:
         score = 50
         breakdown = {}
 
-        source_score = sum(2.5 for ind in self.credible_indicators if ind in text_lower)
-        source_score = min(source_score, 15)
+        source_score = min(sum(2.5 for ind in self.credible_indicators if ind in text_lower), 15)
         score += source_score
         breakdown['source_citations'] = source_score
 
-        sensational_penalty = sum(-3 for ind in self.non_credible_indicators if ind in text_lower)
-        sensational_penalty = max(sensational_penalty, -20)
+        sensational_penalty = max(sum(-3 for ind in self.non_credible_indicators if ind in text_lower), -20)
         score += sensational_penalty
         breakdown['sensationalism_penalty'] = sensational_penalty
 
         words = text.split()
-        if len(words) > 0:
+        if words:
             avg_word_len = np.mean([len(w) for w in words])
             quality_score = 10 if 4 <= avg_word_len <= 7 else (5 if 3 <= avg_word_len <= 8 else 0)
         else:
@@ -247,11 +280,8 @@ class CredibilityScorer:
         score += quality_score
         breakdown['writing_quality'] = quality_score
 
-        if len(text) > 0:
-            caps_ratio = sum(1 for c in text if c.isupper()) / len(text)
-            caps_penalty = -10 if caps_ratio > 0.3 else (-5 if caps_ratio > 0.15 else 0)
-        else:
-            caps_penalty = 0
+        caps_ratio = sum(1 for c in text if c.isupper()) / len(text) if text else 0
+        caps_penalty = -10 if caps_ratio > 0.3 else (-5 if caps_ratio > 0.15 else 0)
         score += caps_penalty
         breakdown['caps_penalty'] = caps_penalty
 
@@ -271,8 +301,11 @@ class CredibilityScorer:
         score += length_bonus
         breakdown['length_bonus'] = length_bonus
 
-        blob = TextBlob(text[:3000])
-        subjectivity = blob.sentiment.subjectivity
+        try:
+            blob = TextBlob(text[:3000])
+            subjectivity = blob.sentiment.subjectivity
+        except Exception:
+            subjectivity = 0.5
         obj_bonus = 10 if subjectivity < 0.3 else (5 if subjectivity < 0.5 else -5)
         score += obj_bonus
         breakdown['objectivity_bonus'] = obj_bonus
@@ -291,91 +324,117 @@ class CredibilityScorer:
 
 
 # =============================================================================
-# SUMMARIZATION FUNCTIONS
+# SUMMARIZATION (extractive only - lightweight, no transformers)
 # =============================================================================
 def extractive_summary(text, num_sentences=3):
     if not text or len(str(text).strip()) == 0:
         return "No text provided for summarization."
     text = str(text)
-    sentences = sent_tokenize(text)
+    sentences = safe_sent_tokenize(text)
     if len(sentences) <= num_sentences:
         return text
 
-    words = word_tokenize(text.lower())
-    stop_words_set = set(stopwords.words('english'))
+    stop_words_set = safe_stopwords()
+    words = safe_word_tokenize(text.lower())
     words = [w for w in words if w.isalnum() and w not in stop_words_set]
     word_freq = Counter(words)
-    max_freq = max(word_freq.values()) if word_freq else 1
+    if not word_freq:
+        return ' '.join(sentences[:num_sentences])
+    max_freq = max(word_freq.values())
     word_freq = {w: f / max_freq for w, f in word_freq.items()}
 
     sentence_scores = {}
     for i, sent in enumerate(sentences):
-        sent_words = word_tokenize(sent.lower())
+        sent_words = safe_word_tokenize(sent.lower())
         score = sum(word_freq.get(w, 0) for w in sent_words if w.isalnum())
         score = score / (len(sent_words) + 1)
         if i < 3:
             score *= 1.2
         sentence_scores[i] = score
 
-    top_indices = sorted(
-        sorted(sentence_scores, key=sentence_scores.get, reverse=True)[:num_sentences]
-    )
+    top_indices = sorted(sorted(sentence_scores, key=sentence_scores.get, reverse=True)[:num_sentences])
     return ' '.join([sentences[i] for i in top_indices])
 
 
-@st.cache_resource
-def load_summarizer():
-    """Load the transformer summarization model."""
-    if HAS_TRANSFORMERS:
-        try:
-            return hf_pipeline(
-                "summarization",
-                model="sshleifer/distilbart-cnn-12-6",
-                device=-1
-            )
-        except Exception:
-            return None
-    return None
-
-
-def generate_summary(text, summarizer_model=None, max_length=150, min_length=50):
-    if not text or len(str(text).strip()) < 50:
-        return "Text too short to summarize."
-    text = str(text)
-    if summarizer_model is not None:
-        try:
-            input_text = text[:2048]
-            result = summarizer_model(
-                input_text, max_length=max_length, min_length=min_length,
-                do_sample=False, truncation=True
-            )
-            return result[0]['summary_text']
-        except Exception:
-            return extractive_summary(text)
+def generate_summary(text):
     return extractive_summary(text)
+
+
+# =============================================================================
+# BUILT-IN TRAINING DATA (small labeled set for bootstrapping)
+# Used only when no saved model & no Kaggle dataset available
+# =============================================================================
+BUILTIN_TRAINING_DATA = [
+    # (text, label) where label 1=real, 0=fake
+    ("According to a study published in the New England Journal of Medicine, researchers at Stanford University found that regular moderate exercise can reduce cardiovascular disease risk by 35 percent. The peer-reviewed study analyzed data from over 100,000 participants.", 1),
+    ("Health officials from the World Health Organization confirmed today that vaccination rates have increased globally. The report, published in a peer-reviewed journal, indicates significant progress in immunization programs.", 1),
+    ("The Federal Reserve announced a 0.25 percent interest rate adjustment following its monthly meeting. According to economists, this change reflects current inflation trends. The decision was reported by major financial news outlets.", 1),
+    ("Scientists at MIT have developed a new battery technology that could improve electric vehicle range. The research, published in Nature, involved three years of testing. Data suggests the technology could be commercialized within five years.", 1),
+    ("The Department of Education released new statistics showing improvements in national literacy rates. According to officials, the data reflects investments made over the past decade. Independent analysis confirms the findings.", 1),
+    ("NASA confirmed the successful launch of a new satellite designed to monitor climate change. The mission, developed in collaboration with international partners, will provide critical atmospheric data. Officials say the satellite is fully operational.", 1),
+    ("A comprehensive review published in the Lancet examined the effectiveness of new cancer treatments. The analysis included data from 50 clinical trials across multiple countries. Researchers concluded that early detection remains crucial.", 1),
+    ("The Bureau of Labor Statistics reported that unemployment rates decreased by 0.3 percent last quarter. Economists analyzing the data suggest the trend indicates economic recovery. The report was corroborated by independent research institutions.", 1),
+    ("Local authorities announced new infrastructure improvements following city council approval. According to the mayor's office, construction will begin next month. The project has been reviewed by independent engineering firms.", 1),
+    ("Researchers at Johns Hopkins University published findings on antibiotic resistance in a leading medical journal. The study, spanning ten years, examined thousands of bacterial samples. Health experts recommend continued surveillance.", 1),
+    # Fake examples
+    ("SHOCKING!!! You WON'T BELIEVE what they've been hiding!!! Secret miracle cure EXPOSED!!! Big Pharma doesn't want you to know!!! SHARE before DELETED!!! Wake up sheeple!!!", 0),
+    ("BREAKING!!! Government conspiracy REVEALED!!! Deep state operatives caught in massive cover-up!!! Mainstream media LIES about everything!!! Click here NOW!!! Limited time offer!!!", 0),
+    ("UNBELIEVABLE miracle discovery! One weird trick doctors HATE! This amazing secret will change your life FOREVER! They banned this because it works too well! Act now!!!", 0),
+    ("TERRIFYING TRUTH EXPOSED! Officials CENSORED this bombshell report! You must see this before it's DELETED! Share with everyone you know! The shocking conspiracy continues!!!", 0),
+    ("INSANE new evidence proves everything is a HOAX! Wake up! The false flag operation has been REVEALED! Mainstream media won't report this! Share before censored!!!", 0),
+    ("MIND BLOWING secret finally revealed! Big pharma doesn't want you to see this! One shocking trick that will destroy the entire industry! Click NOW before it's banned!!!", 0),
+    ("OUTRAGEOUS scandal ROCKS the nation!!! Politicians CAUGHT red-handed in massive cover-up!!! You won't believe what they did next!!! MUST SEE footage!!! Share immediately!!!", 0),
+    ("EPIC discovery obliterates everything scientists thought they knew!!! Establishment DESTROYED by new evidence!!! They don't want you to see this SHOCKING truth!!!", 0),
+    ("URGENT WARNING! Secret document LEAKED reveals horrifying conspiracy! Government trying to hide the truth! Share this before they delete it! Wake up before it's too late!!!", 0),
+    ("STUNNING revelation exposes decades of LIES! The mainstream media won't tell you this bombshell truth! Amazing new evidence proves everything! Must share!!!", 0),
+]
 
 
 # =============================================================================
 # LOAD OR TRAIN MODEL
 # =============================================================================
-@st.cache_resource
-def load_or_train_model():
-    """Load saved model or train a new one."""
-    preprocessor = TextPreprocessor()
-    scorer = CredibilityScorer()
+MODEL_DIR = "models"
+MODEL_PATH = os.path.join(MODEL_DIR, "fake_news_model.joblib")
+VECT_PATH = os.path.join(MODEL_DIR, "tfidf_vectorizer.joblib")
+SCALER_PATH = os.path.join(MODEL_DIR, "feature_scaler.joblib")
 
-    # Try loading saved models
-    if all(os.path.exists(p) for p in [
-        'models/fake_news_model.joblib',
-        'models/tfidf_vectorizer.joblib',
-        'models/feature_scaler.joblib'
-    ]):
-        model = joblib.load('models/fake_news_model.joblib')
-        vectorizer = joblib.load('models/tfidf_vectorizer.joblib')
-        scaler = joblib.load('models/feature_scaler.joblib')
-        return model, vectorizer, scaler, preprocessor, scorer, True
 
-    # If no saved model, train from scratch
+def _train_from_dataframe(df, preprocessor):
+    """Train model from a dataframe with 'full_text' and 'label' columns."""
+    df = df.dropna(subset=['full_text', 'label']).reset_index(drop=True)
+    df['cleaned_text'] = df['full_text'].apply(preprocessor.preprocess_for_tfidf)
+    ling_list = df['full_text'].apply(preprocessor.extract_linguistic_features).tolist()
+    ling_df = pd.DataFrame(ling_list)
+
+    vectorizer = TfidfVectorizer(
+        max_features=20000,
+        ngram_range=(1, 2),
+        min_df=1,
+        max_df=0.95,
+        sublinear_tf=True,
+        dtype=np.float32
+    )
+    X_tfidf = vectorizer.fit_transform(df['cleaned_text'])
+
+    scaler = StandardScaler()
+    X_ling = scaler.fit_transform(ling_df.values)
+
+    X = hstack([X_tfidf, csr_matrix(X_ling)])
+    y = df['label'].astype(int).values
+
+    model = LogisticRegression(C=1.0, max_iter=1000, solver='lbfgs', n_jobs=-1)
+    model.fit(X, y)
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    joblib.dump(model, MODEL_PATH)
+    joblib.dump(vectorizer, VECT_PATH)
+    joblib.dump(scaler, SCALER_PATH)
+
+    return model, vectorizer, scaler
+
+
+def _try_load_kaggle_dataset():
+    """Attempt to download the Kaggle dataset. Returns DataFrame or None."""
     try:
         import kagglehub
         path = kagglehub.dataset_download("mucahiddemircan/real-and-fake-news-dataset")
@@ -384,9 +443,10 @@ def load_or_train_model():
         for root, dirs, files in os.walk(path):
             for file in files:
                 filepath = os.path.join(root, file)
-                if 'true' in file.lower() or 'real' in file.lower():
+                lower = file.lower()
+                if 'true' in lower or 'real' in lower:
                     true_path = filepath
-                elif 'fake' in file.lower():
+                elif 'fake' in lower:
                     fake_path = filepath
 
         if true_path and fake_path:
@@ -401,81 +461,88 @@ def load_or_train_model():
                 for file in files:
                     if file.endswith('.csv'):
                         csv_files.append(os.path.join(root, file))
+            if not csv_files:
+                return None
             df = pd.read_csv(csv_files[0])
+            if 'label' not in df.columns:
+                return None
 
         if 'text' in df.columns and 'title' in df.columns:
             df['full_text'] = df['title'].fillna('') + ' ' + df['text'].fillna('')
         elif 'text' in df.columns:
             df['full_text'] = df['text'].fillna('')
-        else:
+        elif 'title' in df.columns:
             df['full_text'] = df['title'].fillna('')
+        else:
+            return None
 
-        df['cleaned_text'] = df['full_text'].apply(preprocessor.preprocess_for_tfidf)
-        linguistic_features = df['full_text'].apply(preprocessor.extract_linguistic_features)
-        linguistic_df = pd.DataFrame(linguistic_features.tolist())
+        # Sample down to keep training fast on Streamlit Cloud
+        if len(df) > 8000:
+            df = df.groupby('label', group_keys=False).apply(
+                lambda x: x.sample(min(len(x), 4000), random_state=42)
+            ).reset_index(drop=True)
 
-        from sklearn.model_selection import train_test_split
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.preprocessing import StandardScaler
-
-        X_text_train, _, X_ling_train, _, y_train, _ = train_test_split(
-            df['cleaned_text'], linguistic_df.values, df['label'],
-            test_size=0.2, random_state=42, stratify=df['label']
-        )
-
-        vectorizer = TfidfVectorizer(
-            max_features=50000, ngram_range=(1, 3), min_df=3, max_df=0.95,
-            sublinear_tf=True, dtype=np.float32
-        )
-        X_tfidf = vectorizer.fit_transform(X_text_train)
-
-        scaler = StandardScaler()
-        X_ling_scaled = scaler.fit_transform(X_ling_train)
-        X_combined = hstack([X_tfidf, csr_matrix(X_ling_scaled)])
-
-        model = LogisticRegression(C=1.0, max_iter=1000, solver='lbfgs', random_state=42, n_jobs=-1)
-        model.fit(X_combined, y_train)
-
-        os.makedirs('models', exist_ok=True)
-        joblib.dump(model, 'models/fake_news_model.joblib')
-        joblib.dump(vectorizer, 'models/tfidf_vectorizer.joblib')
-        joblib.dump(scaler, 'models/feature_scaler.joblib')
-
-        return model, vectorizer, scaler, preprocessor, scorer, True
-
+        return df[['full_text', 'label']]
     except Exception as e:
-        st.error(f"Error loading/training model: {e}")
-        return None, None, None, preprocessor, scorer, False
+        print(f"Kaggle dataset load failed: {e}")
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def load_or_train_model():
+    """Load saved model or train a new one. Returns (model, vect, scaler, preprocessor, scorer, ok, mode)."""
+    preprocessor = TextPreprocessor()
+    scorer = CredibilityScorer()
+
+    # 1. Try loading saved models
+    if all(os.path.exists(p) for p in [MODEL_PATH, VECT_PATH, SCALER_PATH]):
+        try:
+            model = joblib.load(MODEL_PATH)
+            vectorizer = joblib.load(VECT_PATH)
+            scaler = joblib.load(SCALER_PATH)
+            return model, vectorizer, scaler, preprocessor, scorer, True, "loaded"
+        except Exception as e:
+            print(f"Failed to load saved model: {e}")
+
+    # 2. Try Kaggle dataset
+    df = _try_load_kaggle_dataset()
+    if df is not None and len(df) > 20:
+        try:
+            model, vectorizer, scaler = _train_from_dataframe(df, preprocessor)
+            return model, vectorizer, scaler, preprocessor, scorer, True, "kaggle"
+        except Exception as e:
+            print(f"Kaggle training failed: {e}")
+
+    # 3. Fallback: train on built-in tiny dataset
+    try:
+        df = pd.DataFrame(BUILTIN_TRAINING_DATA, columns=['full_text', 'label'])
+        model, vectorizer, scaler = _train_from_dataframe(df, preprocessor)
+        return model, vectorizer, scaler, preprocessor, scorer, True, "builtin"
+    except Exception as e:
+        print(f"Builtin training failed: {e}")
+        return None, None, None, preprocessor, scorer, False, "failed"
 
 
 # =============================================================================
 # ANALYSIS FUNCTION
 # =============================================================================
-def analyze_article(text, title, model, vectorizer, scaler, preprocessor, scorer, summarizer_model):
-    """Complete article analysis."""
-    full_text = text
-    if title:
-        full_text = title + ' ' + text
+def analyze_article(text, title, model, vectorizer, scaler, preprocessor, scorer):
+    full_text = (title + ' ' + text) if title else text
 
-    # Preprocess
     cleaned = preprocessor.preprocess_for_tfidf(full_text)
 
-    # Extract features
     tfidf_features = vectorizer.transform([cleaned])
     linguistic_features = preprocessor.extract_linguistic_features(full_text)
     ling_array = np.array([list(linguistic_features.values())])
     ling_scaled = scaler.transform(ling_array)
     combined = hstack([tfidf_features, csr_matrix(ling_scaled)])
 
-    # ML Prediction
-    ml_prediction = model.predict(combined)[0]
+    ml_prediction = int(model.predict(combined)[0])
     ml_probability = model.predict_proba(combined)[0]
 
-    # Heuristic scoring
     credibility_score, score_breakdown = scorer.score_article(full_text)
 
-    # Combined assessment
-    ml_real_prob = ml_probability[1]
+    ml_real_prob = float(ml_probability[1])
     combined_score = (ml_real_prob * 70) + (credibility_score / 100 * 30)
 
     if combined_score >= 65:
@@ -488,8 +555,7 @@ def analyze_article(text, title, model, vectorizer, scaler, preprocessor, scorer
         verdict = "LIKELY FAKE"
         confidence_level = "High" if combined_score <= 20 else "Moderate"
 
-    # Summary
-    summary = generate_summary(full_text, summarizer_model)
+    summary = generate_summary(full_text)
 
     return {
         'verdict': verdict,
@@ -498,7 +564,7 @@ def analyze_article(text, title, model, vectorizer, scaler, preprocessor, scorer
         'ml_prediction': 'Real' if ml_prediction == 1 else 'Fake',
         'ml_confidence': round(max(ml_probability) * 100, 1),
         'ml_real_probability': round(ml_real_prob * 100, 1),
-        'ml_fake_probability': round(ml_probability[0] * 100, 1),
+        'ml_fake_probability': round(float(ml_probability[0]) * 100, 1),
         'credibility_score': credibility_score,
         'score_breakdown': score_breakdown,
         'linguistic_features': linguistic_features,
@@ -510,10 +576,9 @@ def analyze_article(text, title, model, vectorizer, scaler, preprocessor, scorer
 
 
 # =============================================================================
-# MAIN APPLICATION
+# MAIN APP
 # =============================================================================
 def main():
-    # Header
     st.markdown("""
     <div class="main-header">
         <h1>🔍 Fake News Detector for Students</h1>
@@ -521,36 +586,35 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # Sidebar
     with st.sidebar:
-        st.image("https://img.icons8.com/doodle/96/000000/news.png", width=80)
         st.title("📰 Navigation")
-
         page = st.radio(
             "Choose a page:",
             ["🏠 Home - Article Analyzer", "📚 How It Works", "💡 Media Literacy Tips"],
             index=0
         )
-
         st.markdown("---")
         st.markdown("### ⚙️ Settings")
         show_detailed = st.checkbox("Show detailed analysis", value=True)
         show_breakdown = st.checkbox("Show score breakdown", value=True)
-
         st.markdown("---")
         st.markdown("### 📊 Model Info")
-        st.info("Model: Logistic Regression + TF-IDF + Linguistic Features")
+        st.info("Logistic Regression + TF-IDF + Linguistic Features")
 
-    # Load model
-    with st.spinner("Loading AI model... This may take a moment on first run."):
-        model, vectorizer, scaler_obj, preprocessor, scorer, model_loaded = load_or_train_model()
+    with st.spinner("Loading AI model... (first run may take a moment)"):
+        model, vectorizer, scaler_obj, preprocessor, scorer, model_loaded, mode = load_or_train_model()
 
-    # Load summarizer
-    summarizer_model = load_summarizer()
+    if model_loaded:
+        if mode == "builtin":
+            st.warning("⚠️ Running with a small built-in demo model. For best accuracy, provide a trained model in the `models/` folder.")
+        elif mode == "kaggle":
+            st.success("✅ Model trained on Kaggle dataset.")
+    else:
+        st.error("❌ Model failed to load. Check dependencies.")
 
     if page == "🏠 Home - Article Analyzer":
         render_home(model, vectorizer, scaler_obj, preprocessor, scorer,
-                    summarizer_model, model_loaded, show_detailed, show_breakdown)
+                    model_loaded, show_detailed, show_breakdown)
     elif page == "📚 How It Works":
         render_how_it_works()
     elif page == "💡 Media Literacy Tips":
@@ -558,12 +622,9 @@ def main():
 
 
 def render_home(model, vectorizer, scaler_obj, preprocessor, scorer,
-                summarizer_model, model_loaded, show_detailed, show_breakdown):
-    """Render the main article analyzer page."""
-
+                model_loaded, show_detailed, show_breakdown):
     st.markdown("## 📝 Paste an Article to Analyze")
 
-    # Input method selection
     input_method = st.radio(
         "Choose input method:",
         ["✍️ Paste Article Text", "📋 Try Example Articles"],
@@ -573,51 +634,40 @@ def render_home(model, vectorizer, scaler_obj, preprocessor, scorer,
     if input_method == "📋 Try Example Articles":
         example_choice = st.selectbox(
             "Select an example:",
-            [
-                "🟢 Real News Example",
-                "🔴 Fake News Example",
-                "🟡 Clickbait Example"
-            ]
+            ["🟢 Real News Example", "🔴 Fake News Example", "🟡 Clickbait Example"]
         )
 
         examples = {
             "🟢 Real News Example": {
                 "title": "New Study Reveals Benefits of Regular Exercise",
                 "text": """According to a comprehensive study published in the New England Journal of Medicine, 
-                researchers at Stanford University have found that regular moderate exercise can reduce the risk 
-                of cardiovascular disease by up to 35%. The peer-reviewed study, which analyzed data from over 
-                100,000 participants across 15 years, suggests that as little as 30 minutes of daily walking 
-                can provide significant health benefits. Dr. Sarah Johnson, the lead researcher, stated that 
-                'the evidence overwhelmingly supports the integration of regular physical activity into daily 
-                routines.' The findings were corroborated by independent analysis from the World Health Organization. 
-                Health officials recommend that adults aim for at least 150 minutes of moderate aerobic activity 
-                per week, combined with muscle-strengthening activities on two or more days per week."""
+researchers at Stanford University have found that regular moderate exercise can reduce the risk 
+of cardiovascular disease by up to 35%. The peer-reviewed study, which analyzed data from over 
+100,000 participants across 15 years, suggests that as little as 30 minutes of daily walking 
+can provide significant health benefits. Dr. Sarah Johnson, the lead researcher, stated that 
+'the evidence overwhelmingly supports the integration of regular physical activity into daily 
+routines.' The findings were corroborated by independent analysis from the World Health Organization."""
             },
             "🔴 Fake News Example": {
                 "title": "SHOCKING!!! Government HIDING Miracle Cure!!!",
                 "text": """You WON'T BELIEVE what they've been keeping from us!!! A SECRET cure for ALL diseases 
-                has been discovered but Big Pharma doesn't want you to know!!! EXPOSED: The deep state conspiracy 
-                to keep us sick and dependent on their POISON medications!!! SHARE THIS BEFORE THEY DELETE IT!!! 
-                Wake up sheeple!!! The mainstream media LIES about everything!!! This AMAZING miracle cure has been 
-                BANNED because it would DESTROY the pharmaceutical industry!!! ACT NOW before it's too late!!! 
-                They don't want you to know the SHOCKING TRUTH!!! Click here to learn the secret!!!"""
+has been discovered but Big Pharma doesn't want you to know!!! EXPOSED: The deep state conspiracy 
+to keep us sick and dependent on their POISON medications!!! SHARE THIS BEFORE THEY DELETE IT!!! 
+Wake up sheeple!!! The mainstream media LIES about everything!!! Click here to learn the secret!!!"""
             },
             "🟡 Clickbait Example": {
                 "title": "This One Weird Trick Will Change Your Life Forever!",
                 "text": """Scientists are baffled by this incredible discovery that could change everything we know 
-                about health. A mysterious fruit found in a remote island has properties that experts say could 
-                revolutionize medicine. While some researchers have expressed interest, no clinical trials have been 
-                conducted yet. The story has been shared millions of times on social media, with many claiming 
-                miraculous results. However, no peer-reviewed studies have confirmed these claims. Several fact-checking 
-                organizations have flagged similar stories as misleading. The article originally appeared on a website 
-                known for publishing sensational health claims without scientific backing."""
+about health. A mysterious fruit found in a remote island has properties that experts say could 
+revolutionize medicine. While some researchers have expressed interest, no clinical trials have been 
+conducted yet. The story has been shared millions of times on social media, with many claiming 
+miraculous results. However, no peer-reviewed studies have confirmed these claims."""
             }
         }
 
         selected = examples[example_choice]
         article_title = st.text_input("Article Title:", value=selected["title"])
         article_text = st.text_area("Article Text:", value=selected["text"], height=250)
-
     else:
         article_title = st.text_input("Article Title (optional):", placeholder="Enter the article headline...")
         article_text = st.text_area(
@@ -626,47 +676,35 @@ def render_home(model, vectorizer, scaler_obj, preprocessor, scorer,
             placeholder="Paste the full article text here for analysis..."
         )
 
-    # Analyze button
     col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
     with col_btn2:
         analyze_button = st.button("🔍 Analyze Article", type="primary", use_container_width=True)
 
     if analyze_button and article_text.strip():
         if not model_loaded:
-            st.error("⚠️ Model not loaded. Please ensure the model files exist in the 'models/' directory or that kagglehub can download the dataset.")
+            st.error("⚠️ Model not available.")
             return
 
-        with st.spinner("🔄 Analyzing article... Please wait."):
-            progress_bar = st.progress(0)
-            for i in range(100):
-                time.sleep(0.01)
-                progress_bar.progress(i + 1)
+        with st.spinner("🔄 Analyzing article..."):
+            try:
+                result = analyze_article(
+                    article_text, article_title, model, vectorizer, scaler_obj,
+                    preprocessor, scorer
+                )
+            except Exception as e:
+                st.error(f"Analysis failed: {e}")
+                return
 
-            result = analyze_article(
-                article_text, article_title, model, vectorizer, scaler_obj,
-                preprocessor, scorer, summarizer_model
-            )
-
-        progress_bar.empty()
-
-        # Display Results
         st.markdown("---")
         st.markdown("## 📊 Analysis Results")
 
-        # Verdict Banner
         verdict = result['verdict']
         if "REAL" in verdict:
-            verdict_class = "verdict-real"
-            verdict_emoji = "✅"
-            verdict_color = "#28a745"
+            verdict_class, verdict_emoji = "verdict-real", "✅"
         elif "FAKE" in verdict:
-            verdict_class = "verdict-fake"
-            verdict_emoji = "❌"
-            verdict_color = "#dc3545"
+            verdict_class, verdict_emoji = "verdict-fake", "❌"
         else:
-            verdict_class = "verdict-uncertain"
-            verdict_emoji = "⚠️"
-            verdict_color = "#ffc107"
+            verdict_class, verdict_emoji = "verdict-uncertain", "⚠️"
 
         st.markdown(f"""
         <div class="{verdict_class}">
@@ -676,39 +714,20 @@ def render_home(model, vectorizer, scaler_obj, preprocessor, scorer,
         </div>
         """, unsafe_allow_html=True)
 
-        # Key Metrics
         col1, col2, col3, col4 = st.columns(4)
-
         with col1:
-            st.metric(
-                "🤖 ML Prediction",
-                result['ml_prediction'],
-                f"{result['ml_confidence']}% confident"
-            )
-
+            st.metric("🤖 ML Prediction", result['ml_prediction'], f"{result['ml_confidence']}% confident")
         with col2:
-            st.metric(
-                "📊 Credibility Score",
-                f"{result['credibility_score']}/100",
-                f"{'Good' if result['credibility_score'] >= 60 else 'Concerning'}"
-            )
-
+            st.metric("📊 Credibility Score", f"{result['credibility_score']}/100",
+                      f"{'Good' if result['credibility_score'] >= 60 else 'Concerning'}")
         with col3:
-            st.metric(
-                "📝 Word Count",
-                result['word_count'],
-                f"{'Substantial' if result['word_count'] > 200 else 'Short'}"
-            )
-
+            st.metric("📝 Word Count", int(result['word_count']),
+                      f"{'Substantial' if result['word_count'] > 200 else 'Short'}")
         with col4:
             subj = result['sentiment_subjectivity']
-            st.metric(
-                "🎭 Subjectivity",
-                f"{subj:.2f}",
-                f"{'Objective' if subj < 0.4 else 'Subjective'}"
-            )
+            st.metric("🎭 Subjectivity", f"{subj:.2f}",
+                      f"{'Objective' if subj < 0.4 else 'Subjective'}")
 
-        # Summary Section
         st.markdown("### 📋 Article Summary")
         st.markdown(f"""
         <div class="summary-box">
@@ -718,26 +737,19 @@ def render_home(model, vectorizer, scaler_obj, preprocessor, scorer,
 
         if show_detailed:
             st.markdown("### 🔬 Detailed Analysis")
-
-            col_detail1, col_detail2 = st.columns(2)
-
-            with col_detail1:
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
                 st.markdown("#### ML Model Assessment")
                 st.write(f"**Probability of being Real:** {result['ml_real_probability']}%")
                 st.write(f"**Probability of being Fake:** {result['ml_fake_probability']}%")
-
-                # Probability bar
                 st.progress(result['ml_real_probability'] / 100)
                 st.caption(f"Real ← {result['ml_real_probability']}% | {result['ml_fake_probability']}% → Fake")
-
-            with col_detail2:
+            with col_d2:
                 st.markdown("#### Sentiment Analysis")
-                st.write(f"**Polarity:** {result['sentiment_polarity']} "
-                         f"({'Positive' if result['sentiment_polarity'] > 0 else 'Negative' if result['sentiment_polarity'] < 0 else 'Neutral'})")
+                pol = result['sentiment_polarity']
+                st.write(f"**Polarity:** {pol} ({'Positive' if pol > 0 else 'Negative' if pol < 0 else 'Neutral'})")
                 st.write(f"**Subjectivity:** {result['sentiment_subjectivity']} "
                          f"({'Objective' if result['sentiment_subjectivity'] < 0.4 else 'Subjective'})")
-
-                # Linguistic features
                 ling = result['linguistic_features']
                 st.write(f"**Exclamation Marks:** {ling.get('exclamation_count', 0)}")
                 st.write(f"**Sensational Words:** {ling.get('sensational_word_count', 0)}")
@@ -745,24 +757,19 @@ def render_home(model, vectorizer, scaler_obj, preprocessor, scorer,
 
         if show_breakdown:
             st.markdown("### 📈 Credibility Score Breakdown")
-
             breakdown = result['score_breakdown']
-            breakdown_data = {
-                'Factor': [],
-                'Points': [],
-                'Impact': []
-            }
+            rows = []
             for factor, points in breakdown.items():
-                if factor != 'subjectivity_value':
-                    impact = "🟢 Positive" if points > 0 else ("🔴 Negative" if points < 0 else "⚪ Neutral")
-                    breakdown_data['Factor'].append(factor.replace('_', ' ').title())
-                    breakdown_data['Points'].append(points)
-                    breakdown_data['Impact'].append(impact)
+                if factor == 'subjectivity_value':
+                    continue
+                impact = "🟢 Positive" if points > 0 else ("🔴 Negative" if points < 0 else "⚪ Neutral")
+                rows.append({
+                    'Factor': factor.replace('_', ' ').title(),
+                    'Points': points,
+                    'Impact': impact
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-            breakdown_df = pd.DataFrame(breakdown_data)
-            st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
-
-        # Student Tips
         st.markdown("### 💡 What Should You Do?")
         if "REAL" in verdict:
             st.success("""
@@ -777,14 +784,12 @@ def render_home(model, vectorizer, scaler_obj, preprocessor, scorer,
             - Do NOT share this article without verification
             - Check fact-checking sites (Snopes, FactCheck.org, PolitiFact)
             - Look for the same story from established news organizations
-            - Be wary of emotional manipulation and sensational language
             """)
         else:
             st.warning("""
             ⚠️ The credibility of this article is uncertain:
             - Seek additional sources before forming an opinion
-            - Look for direct quotes and data sources in the article
-            - Check if the author and publication are established
+            - Look for direct quotes and data sources
             - Use fact-checking tools for specific claims
             """)
 
@@ -793,192 +798,75 @@ def render_home(model, vectorizer, scaler_obj, preprocessor, scorer,
 
 
 def render_how_it_works():
-    """Render the 'How It Works' page."""
     st.markdown("## 📚 How the Fake News Detector Works")
-
     st.markdown("""
     Our AI-powered fake news detector uses a **multi-layered approach** combining 
     machine learning and heuristic analysis to assess the credibility of news articles.
     """)
-
     st.markdown("### 🔄 Analysis Pipeline")
-
     col1, col2, col3 = st.columns(3)
-
     with col1:
         st.markdown("""
         #### 1️⃣ Text Analysis
-        - **TF-IDF Vectorization**: Converts text into numerical features 
-          using word frequency analysis
-        - **N-gram Analysis**: Examines word patterns (unigrams, bigrams, trigrams)
-        - **Linguistic Feature Extraction**: 21 handcrafted features including 
-          sentiment, readability, and stylistic patterns
+        - **TF-IDF Vectorization**
+        - **N-gram Analysis**
+        - **21 Linguistic Features**
         """)
-
     with col2:
         st.markdown("""
         #### 2️⃣ ML Classification
-        - **Trained Classifier**: Logistic Regression model trained on 
-          44,000+ real and fake news articles
-        - **Feature Combination**: Combines TF-IDF text features with 
-          linguistic features for robust prediction
-        - **Probability Estimation**: Outputs confidence scores for 
-          both real and fake classifications
+        - **Logistic Regression** trained on news articles
+        - **Feature Combination** of TF-IDF + linguistic features
+        - **Probability Estimation**
         """)
-
     with col3:
         st.markdown("""
         #### 3️⃣ Credibility Assessment
-        - **Heuristic Scoring**: Rule-based checks for source citations, 
-          sensationalism, writing quality
-        - **Combined Score**: Weighted combination of ML prediction (70%) 
-          and heuristic score (30%)
-        - **Summary Generation**: AI-powered article summarization for 
-          quick understanding
+        - **Heuristic Scoring**
+        - **Combined Score** (ML 70% + Heuristic 30%)
+        - **Extractive Summary**
         """)
 
     st.markdown("---")
     st.markdown("### 🧠 Linguistic Features Analyzed")
-
     features_explained = {
         "Sentiment Polarity": "Measures if the text is positive, negative, or neutral",
-        "Subjectivity Score": "Determines if the text is objective (fact-based) or subjective (opinion-based)",
+        "Subjectivity Score": "Determines if the text is objective or subjective",
         "Sensational Word Count": "Counts clickbait/emotional trigger words",
         "Vocabulary Richness": "Measures diversity of word usage",
         "Uppercase Ratio": "Excessive capitals often indicate unreliable content",
         "Exclamation Marks": "Overuse of ! is a common fake news indicator",
-        "Average Word Length": "Professional writing tends to have consistent word lengths",
-        "Sentence Length": "Very short or very long sentences may indicate quality issues",
         "Source Citations": "Presence of references to studies, experts, or data",
-        "Type-Token Ratio": "Lexical diversity measurement"
     }
-
     for feature, description in features_explained.items():
         st.markdown(f"- **{feature}**: {description}")
 
-    st.markdown("---")
-    st.markdown("### 📊 Model Training Details")
-
-    st.info("""
-    - **Dataset**: Real and Fake News Dataset from Kaggle (44,000+ articles)
-    - **Algorithm**: Logistic Regression with combined TF-IDF + Linguistic features
-    - **TF-IDF Features**: Up to 50,000 features with tri-gram analysis
-    - **Linguistic Features**: 21 handcrafted features
-    - **Validation**: 5-fold stratified cross-validation
-    """)
-
 
 def render_tips():
-    """Render the media literacy tips page."""
     st.markdown("## 💡 Media Literacy Tips for Students")
-
-    st.markdown("""
-    Learning to identify fake news is an essential skill in the digital age. 
-    Here are practical tips to help you evaluate news sources critically.
-    """)
-
     tips = [
-        {
-            "title": "🔍 Check the Source",
-            "content": """
-            - Is the website well-known and reputable?
-            - Does it have a professional design with proper 'About Us' and 'Contact' pages?
-            - Check the URL: fake sites often mimic real ones (e.g., 'ABCnews.com.co')
-            - Look up the domain on sites like Whois.net
-            """
-        },
-        {
-            "title": "👤 Verify the Author",
-            "content": """
-            - Is the author a real person with verifiable credentials?
-            - Search for other articles by the same author
-            - Does the author have expertise in the topic they're writing about?
-            - Check their social media profiles for legitimacy
-            """
-        },
-        {
-            "title": "📅 Check the Date",
-            "content": """
-            - Is the article current or is old news being reshared?
-            - Sometimes real articles are shared out of context with misleading dates
-            - Check if the events described are timely and relevant
-            """
-        },
-        {
-            "title": "🔗 Cross-Reference",
-            "content": """
-            - Search for the same story on multiple trusted news sources
-            - If only one source is reporting it, be skeptical
-            - Use fact-checking websites:
-              - [Snopes.com](https://www.snopes.com)
-              - [FactCheck.org](https://www.factcheck.org)
-              - [PolitiFact](https://www.politifact.com)
-              - [Reuters Fact Check](https://www.reuters.com/fact-check)
-            """
-        },
-        {
-            "title": "🎭 Watch for Emotional Manipulation",
-            "content": """
-            - Fake news often tries to make you angry, scared, or outraged
-            - Be suspicious of ALL-CAPS text and excessive exclamation marks!!!
-            - Clickbait headlines like 'You won't believe...' are red flags
-            - Take a pause before sharing emotionally charged content
-            """
-        },
-        {
-            "title": "🖼️ Verify Images and Videos",
-            "content": """
-            - Use Google Reverse Image Search to check if images are taken out of context
-            - Look for signs of photo manipulation
-            - Check if the image matches the article's claims
-            - Be especially cautious of AI-generated images (deepfakes)
-            """
-        },
-        {
-            "title": "📊 Look for Evidence",
-            "content": """
-            - Does the article cite specific studies, data, or expert opinions?
-            - Are there links to original sources?
-            - Does it quote named officials or use vague terms like 'experts say'?
-            - Check if the statistics cited are accurate
-            """
-        },
-        {
-            "title": "🧠 Check Your Own Biases",
-            "content": """
-            - We're more likely to believe news that confirms our existing beliefs
-            - Be extra critical of articles that perfectly align with your views
-            - Seek out diverse perspectives on important issues
-            - Practice intellectual humility
-            """
-        }
+        ("🔍 Check the Source", "Is the website reputable? Check the URL, About page, and design quality."),
+        ("👤 Verify the Author", "Is the author a real, credentialed person? Search for their other work."),
+        ("📅 Check the Date", "Is the article current, or is old news being reshared out of context?"),
+        ("🔗 Cross-Reference", "Search the story on multiple trusted sources. Use Snopes, FactCheck.org, PolitiFact."),
+        ("🎭 Watch Emotional Manipulation", "Beware ALL-CAPS, excessive !!!, and clickbait headlines."),
+        ("🖼️ Verify Images", "Use Google Reverse Image Search. Watch for deepfakes."),
+        ("📊 Look for Evidence", "Does the article cite specific studies, data, or named experts?"),
+        ("🧠 Check Your Own Biases", "Be extra critical of articles that align perfectly with your views."),
     ]
-
-    for tip in tips:
-        with st.expander(tip["title"], expanded=False):
-            st.markdown(tip["content"])
-
-    st.markdown("---")
-    st.markdown("### 🏫 Classroom Activity Ideas")
-    st.markdown("""
-    1. **Spot the Fake**: Give students a mix of real and fake articles to classify
-    2. **Source Investigation**: Research the credibility of different news websites
-    3. **Headline Analysis**: Rewrite sensational headlines to be factual
-    4. **Fact-Check Challenge**: Verify claims from social media posts
-    5. **Create a News Evaluation Checklist**: Students develop their own criteria
-    """)
+    for title, content in tips:
+        with st.expander(title, expanded=False):
+            st.markdown(content)
 
     st.markdown("---")
-    st.markdown("### 📱 Useful Tools and Resources")
+    st.markdown("### 📱 Useful Fact-Checking Resources")
     resources = {
         "Google Fact Check Explorer": "https://toolbox.google.com/factcheck/explorer",
         "Snopes": "https://www.snopes.com",
         "FactCheck.org": "https://www.factcheck.org",
+        "PolitiFact": "https://www.politifact.com",
         "News Literacy Project": "https://newslit.org",
-        "MediaWise": "https://www.poynter.org/mediawise/",
-        "AllSides Media Bias Chart": "https://www.allsides.com/media-bias/media-bias-chart"
     }
-
     for name, url in resources.items():
         st.markdown(f"- [{name}]({url})")
 
